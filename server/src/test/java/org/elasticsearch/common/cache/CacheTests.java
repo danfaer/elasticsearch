@@ -43,6 +43,7 @@ import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 
 public class CacheTests extends ESTestCase {
     private int numberOfEntries;
@@ -683,6 +684,52 @@ public class CacheTests extends ESTestCase {
     }
 
     /**
+     * A put replaces an entry whose own put has not linked it into the LRU list yet. The replaced entry must stay out of the
+     * list, and it is reported as replaced.
+     */
+    public void testPutReplacingEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> cache.put(1, "first"), () -> cache.put(1, "second"));
+        assertReplacedBeforeLinked(cache, notifications);
+    }
+
+    /**
+     * Like {@link #testPutReplacingEntryNotYetLinked}, but the replaced entry was loaded by computeIfAbsent.
+     */
+    public void testPutReplacingComputedEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> {
+            try {
+                cache.computeIfAbsent(1, k -> "first");
+            } catch (ExecutionException e) {
+                throw new AssertionError(e);
+            }
+        }, () -> cache.put(1, "second"));
+        assertReplacedBeforeLinked(cache, notifications);
+    }
+
+    /**
+     * Invalidates an entry whose put has not linked it into the LRU list yet. The entry must stay out of the list, and it is
+     * reported as invalidated.
+     */
+    public void testInvalidateEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> cache.put(1, "first"), () -> cache.invalidate(1));
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(), keys);
+        assertEquals(0, cache.count());
+        assertEquals(0, cache.weight());
+        assertNull(cache.get(1));
+        assertEquals(1, notifications.size());
+        assertEquals(RemovalNotification.RemovalReason.INVALIDATED, notifications.get(0).getRemovalReason());
+        assertEquals("first", notifications.get(0).getValue());
+    }
+
+    /**
      * Runs {@code write} on another thread until it waits for lruLock, with its entry in the segment but not yet in the LRU
      * list, and then runs {@code action} on this thread while holding lruLock, so that all of {@code action} happens first.
      */
@@ -698,6 +745,18 @@ public class CacheTests extends ESTestCase {
             lruLock.unlock();
         }
         safeJoin(writer);
+    }
+
+    private static void assertReplacedBeforeLinked(Cache<Integer, String> cache, List<RemovalNotification<Integer, String>> notifications) {
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(1), keys);
+        assertEquals(1, cache.count());
+        assertEquals(1, cache.weight());
+        assertEquals("second", cache.get(1));
+        assertEquals(1, notifications.size());
+        assertEquals(RemovalNotification.RemovalReason.REPLACED, notifications.get(0).getRemovalReason());
+        assertEquals("first", notifications.get(0).getValue());
     }
 
     public void testComputeIfAbsentLoadsSuccessfully() {
@@ -924,7 +983,15 @@ public class CacheTests extends ESTestCase {
             }
         });
         cache.refresh();
-        assertEquals(500, cache.count());
+        // a put can evict while the entry it replaces still takes room in the LRU list, so the cache may end below its maximum
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("duplicate keys in " + keys, keys.size(), new HashSet<>(keys).size());
+        for (Integer key : keys) {
+            assertNotNull("key " + key + " is in the LRU list but not in the cache", cache.get(key));
+        }
+        assertEquals(keys.size(), cache.count());
+        assertThat(cache.count(), lessThanOrEqualTo(500));
     }
 
     public void testRemoveUsingValuesIterator() {

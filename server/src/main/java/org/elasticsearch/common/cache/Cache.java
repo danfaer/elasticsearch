@@ -623,7 +623,7 @@ public class Cache<K, V> {
         boolean replaced = false;
         lruLock.lock();
         try {
-            if (tuple.v2() != null && tuple.v2().state == State.EXISTING) {
+            if (tuple.v2() != null) {
                 if (unlink(tuple.v2())) {
                     replaced = true;
                 }
@@ -1029,6 +1029,10 @@ public class Cache<K, V> {
 
             count--;
             weight -= weigher.applyAsLong(entry.key, entry.value);
+            entry.state = State.DELETED;
+            return true;
+        } else if (entry.state == State.NEW) {
+            // removed before its put or load linked it
             entry.state = State.DELETED;
             return true;
         } else {
