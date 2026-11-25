@@ -344,6 +344,36 @@ public class Cache<K, V> {
         }
 
         /**
+         * remove the mapping for the entry's key iff it is this exact entry; unlike {@link #remove(Object, Object, boolean)} this
+         * does not compare values, so it cannot remove a newer entry for the same key whose value happens to be equal
+         *
+         * @param entry the entry to remove from the segment
+         */
+        void removeEntry(Entry<K, V> entry) {
+            boolean removed = false;
+            writeLock.lock();
+            try {
+                CompletableFuture<Entry<K, V>> future = map == null ? null : map.get(entry.key);
+                try {
+                    if (future != null && future.isDone() && future.get() == entry) {
+                        removed = map.remove(entry.key, future);
+                        if (map.isEmpty()) {
+                            map = null;
+                        }
+                    }
+                } catch (ExecutionException | InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            } finally {
+                writeLock.unlock();
+            }
+
+            if (removed) {
+                evictions.increment();
+            }
+        }
+
+        /**
          * remove every entry from the segment whose key matches the predicate
          *
          * @param predicate the predicate that keys of entries to remove must match
@@ -857,7 +887,7 @@ public class Cache<K, V> {
             Entry<K, V> entry = current;
             if (entry != null) {
                 CacheSegment segment = getCacheSegment(entry.key);
-                segment.remove(entry.key, entry.value, false);
+                segment.removeEntry(entry);
                 lruLock.lock();
                 try {
                     current = null;
@@ -903,6 +933,11 @@ public class Cache<K, V> {
         }
     }
 
+    // pkg-private for testing
+    ReentrantLock getLruLock() {
+        return lruLock;
+    }
+
     private void promote(Entry<K, V> entry, long now) {
         boolean promoted = true;
         lruLock.lock();
@@ -933,7 +968,7 @@ public class Cache<K, V> {
 
         CacheSegment segment = getCacheSegment(entry.key);
         if (segment != null) {
-            segment.remove(entry.key, entry.value, false);
+            segment.removeEntry(entry);
         }
         delete(entry, RemovalNotification.RemovalReason.EVICTED);
     }

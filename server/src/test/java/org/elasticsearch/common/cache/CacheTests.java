@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.instanceOf;
@@ -664,6 +665,39 @@ public class CacheTests extends ESTestCase {
             }
         }
         assertEquals(replacements, notifications);
+    }
+
+    /**
+     * Evicts an entry that a put of an equal value has just replaced in the segment, before that put relinks the key. The
+     * eviction must remove only the evicted entry, not the new mapping, which compares equal to it.
+     */
+    public void testEvictionKeepsReplacementWithEqualValue() throws Exception {
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().setMaximumWeight(1).build();
+        cache.put(1, "value");
+        beforeLinked(cache, () -> cache.put(1, "value"), () -> cache.put(2, "other"));
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(1), keys);
+        assertEquals("value", cache.get(1));
+        assertEquals(1, cache.count());
+    }
+
+    /**
+     * Runs {@code write} on another thread until it waits for lruLock, with its entry in the segment but not yet in the LRU
+     * list, and then runs {@code action} on this thread while holding lruLock, so that all of {@code action} happens first.
+     */
+    private static void beforeLinked(Cache<Integer, String> cache, Runnable write, Runnable action) throws Exception {
+        ReentrantLock lruLock = cache.getLruLock();
+        Thread writer = new Thread(write);
+        lruLock.lock();
+        try {
+            writer.start();
+            assertBusy(() -> assertTrue(lruLock.hasQueuedThread(writer)));
+            action.run();
+        } finally {
+            lruLock.unlock();
+        }
+        safeJoin(writer);
     }
 
     public void testComputeIfAbsentLoadsSuccessfully() {
