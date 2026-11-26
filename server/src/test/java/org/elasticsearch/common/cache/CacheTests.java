@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.instanceOf;
@@ -666,6 +667,97 @@ public class CacheTests extends ESTestCase {
         assertEquals(replacements, notifications);
     }
 
+    /**
+     * Evicts an entry that a put of an equal value has just replaced in the segment, before that put relinks the key. The
+     * eviction must remove only the evicted entry, not the new mapping, which compares equal to it.
+     */
+    public void testEvictionKeepsReplacementWithEqualValue() throws Exception {
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().setMaximumWeight(1).build();
+        cache.put(1, "value");
+        beforeLinked(cache, () -> cache.put(1, "value"), () -> cache.put(2, "other"));
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(1), keys);
+        assertEquals("value", cache.get(1));
+        assertEquals(1, cache.count());
+    }
+
+    /**
+     * A put replaces an entry whose own put has not linked it into the LRU list yet. The replaced entry must stay out of the
+     * list, and it is reported as replaced.
+     */
+    public void testPutReplacingEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> cache.put(1, "first"), () -> cache.put(1, "second"));
+        assertReplacedBeforeLinked(cache, notifications);
+    }
+
+    /**
+     * Like {@link #testPutReplacingEntryNotYetLinked}, but the replaced entry was loaded by computeIfAbsent.
+     */
+    public void testPutReplacingComputedEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> {
+            try {
+                cache.computeIfAbsent(1, k -> "first");
+            } catch (ExecutionException e) {
+                throw new AssertionError(e);
+            }
+        }, () -> cache.put(1, "second"));
+        assertReplacedBeforeLinked(cache, notifications);
+    }
+
+    /**
+     * Invalidates an entry whose put has not linked it into the LRU list yet. The entry must stay out of the list, and it is
+     * reported as invalidated.
+     */
+    public void testInvalidateEntryNotYetLinked() throws Exception {
+        List<RemovalNotification<Integer, String>> notifications = new CopyOnWriteArrayList<>();
+        Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().removalListener(notifications::add).build();
+        beforeLinked(cache, () -> cache.put(1, "first"), () -> cache.invalidate(1));
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(), keys);
+        assertEquals(0, cache.count());
+        assertEquals(0, cache.weight());
+        assertNull(cache.get(1));
+        assertEquals(1, notifications.size());
+        assertEquals(RemovalNotification.RemovalReason.INVALIDATED, notifications.get(0).getRemovalReason());
+        assertEquals("first", notifications.get(0).getValue());
+    }
+
+    /**
+     * Runs {@code write} on another thread until it waits for lruLock, with its entry in the segment but not yet in the LRU
+     * list, and then runs {@code action} on this thread while holding lruLock, so that all of {@code action} happens first.
+     */
+    private static void beforeLinked(Cache<Integer, String> cache, Runnable write, Runnable action) throws Exception {
+        ReentrantLock lruLock = cache.getLruLock();
+        Thread writer = new Thread(write);
+        lruLock.lock();
+        try {
+            writer.start();
+            assertBusy(() -> assertTrue(lruLock.hasQueuedThread(writer)));
+            action.run();
+        } finally {
+            lruLock.unlock();
+        }
+        safeJoin(writer);
+    }
+
+    private static void assertReplacedBeforeLinked(Cache<Integer, String> cache, List<RemovalNotification<Integer, String>> notifications) {
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        assertEquals("keys in the LRU list", List.of(1), keys);
+        assertEquals(1, cache.count());
+        assertEquals(1, cache.weight());
+        assertEquals("second", cache.get(1));
+        assertEquals(1, notifications.size());
+        assertEquals(RemovalNotification.RemovalReason.REPLACED, notifications.get(0).getRemovalReason());
+        assertEquals("first", notifications.get(0).getValue());
+    }
+
     public void testComputeIfAbsentLoadsSuccessfully() {
         Map<Integer, Integer> map = new HashMap<>();
         Cache<Integer, Integer> cache = CacheBuilder.<Integer, Integer>builder().build();
@@ -891,6 +983,66 @@ public class CacheTests extends ESTestCase {
         });
         cache.refresh();
         assertEquals(500, cache.count());
+    }
+
+    /**
+     * Puts unique values for a few keys from many threads, so a put can replace an entry whose own put has not linked it yet.
+     * Afterwards the LRU list must hold exactly the mapped entries, each key once.
+     */
+    public void testGhostEntriesFromConcurrentPuts() {
+        final Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().build();
+        final AtomicInteger values = new AtomicInteger();
+        final long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        startInParallel(8, i -> {
+            Random random = new Random(random().nextLong());
+            while (System.nanoTime() < end) {
+                cache.put(random.nextInt(64), String.valueOf(values.incrementAndGet()));
+            }
+        });
+        long ghosts = ghosts(cache);
+        assertEquals("ghosts " + ghosts + ", count " + cache.count(), 0, ghosts);
+        long duplicates = duplicateKeys(cache);
+        assertEquals("duplicate keys " + duplicates, 0, duplicates);
+    }
+
+    /**
+     * Evicts from a small cache while many threads put values equal to their keys, over 20 fresh caches.
+     * Each must end with exactly the mapped entries in the LRU list, each key once.
+     */
+    public void testGhostEntriesFromEvictionWithEqualValues() {
+        for (int round = 0; round < 20; round++) {
+            final Cache<Integer, String> cache = CacheBuilder.<Integer, String>builder().setMaximumWeight(32).build();
+            final long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100);
+            startInParallel(8, i -> {
+                Random random = new Random(random().nextLong());
+                while (System.nanoTime() < end) {
+                    int key = random.nextInt(128);
+                    cache.put(key, String.valueOf(key));
+                }
+            });
+            long ghosts = ghosts(cache);
+            assertEquals("round " + round + ", ghosts " + ghosts + ", count " + cache.count(), 0, ghosts);
+            long duplicates = duplicateKeys(cache);
+            assertEquals("round " + round + ", duplicate keys " + duplicates, 0, duplicates);
+        }
+    }
+
+    /**
+     * The entries in the LRU list that no segment maps.
+     */
+    private static long ghosts(Cache<Integer, String> cache) {
+        AtomicInteger mapped = new AtomicInteger();
+        cache.forEach((key, value) -> mapped.incrementAndGet());
+        return cache.count() - mapped.get();
+    }
+
+    /**
+     * The number of times the LRU list lists a key it has already listed.
+     */
+    private static long duplicateKeys(Cache<Integer, String> cache) {
+        List<Integer> keys = new ArrayList<>();
+        cache.keys().forEach(keys::add);
+        return keys.size() - new HashSet<>(keys).size();
     }
 
     public void testRemoveUsingValuesIterator() {

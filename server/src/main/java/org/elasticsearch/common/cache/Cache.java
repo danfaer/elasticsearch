@@ -903,6 +903,11 @@ public class Cache<K, V> {
         }
     }
 
+    // pkg-private for testing
+    ReentrantLock getLruLock() {
+        return lruLock;
+    }
+
     private void promote(Entry<K, V> entry, long now) {
         boolean promoted = true;
         lruLock.lock();
